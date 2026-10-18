@@ -1,0 +1,31 @@
+{
+  "name": "sales-nav-search-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "enrich": "node enrichment/index.js",
+    "enrich:llm": "node enrichment-llm/index.js",
+    "start": "node enrichment-llm/server.js",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "dexie": "latest",
+    "openai": "^7.17.0",
+    "pg": "^8.23.1",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "webextension-polyfill": "latest"
+  },
+  "devDependencies": {
+    "@types/chrome": "latest",
+    "@types/node": "^26.1.1",
+    "@types/react": "latest",
+    "@types/react-dom": "latest"
+  }
+}
