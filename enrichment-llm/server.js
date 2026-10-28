@@ -23,6 +23,22 @@ function validDomain(domain) {
   return /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(domain);
 }
 
+function normalizeDomainInput(input) {
+  const value = input.trim().toLowerCase();
+  const urlInput = /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `https://${value}`;
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(urlInput);
+  } catch {
+    return null;
+  }
+
+  if (!['http:', 'https:'].includes(parsedUrl.protocol)) return null;
+  const domain = parsedUrl.hostname.replace(/^www\./, '');
+  return validDomain(domain) ? domain : null;
+}
+
 async function readJsonBody(request) {
   let body = '';
   for await (const chunk of request) {
@@ -83,9 +99,9 @@ async function handleEnrich(request, response) {
       return;
     }
 
-    const domain = payload.domain.trim().toLowerCase();
-    if (!validDomain(domain)) {
-      sendJson(response, 400, { error: 'invalid_request', message: 'Provide a valid domain, for example "stripe.com".' });
+    const domain = normalizeDomainInput(payload.domain);
+    if (!domain) {
+      sendJson(response, 400, { error: 'invalid_request', message: 'Provide a valid HTTP website URL or domain, for example "https://stripe.com/about".' });
       return;
     }
 
