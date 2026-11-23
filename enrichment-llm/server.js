@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { CompanyEnrichmentCache } from './companyEnrichmentCache.js';
+import { normalizeDomainInput } from './domainInput.js';
 import { enrichCompany, loadEnv } from './index.js';
 
 const MAX_REQUEST_BODY_BYTES = 16 * 1024;
@@ -17,26 +18,6 @@ function keysMatch(actual, expected) {
   const actualBuffer = Buffer.from(actual);
   const expectedBuffer = Buffer.from(expected);
   return actualBuffer.length === expectedBuffer.length && timingSafeEqual(actualBuffer, expectedBuffer);
-}
-
-function validDomain(domain) {
-  return /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(domain);
-}
-
-function normalizeDomainInput(input) {
-  const value = input.trim().toLowerCase();
-  const urlInput = /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `https://${value}`;
-  let parsedUrl;
-
-  try {
-    parsedUrl = new URL(urlInput);
-  } catch {
-    return null;
-  }
-
-  if (!['http:', 'https:'].includes(parsedUrl.protocol)) return null;
-  const domain = parsedUrl.hostname.replace(/^www\./, '');
-  return validDomain(domain) ? domain : null;
 }
 
 async function readJsonBody(request) {

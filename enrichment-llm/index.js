@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
 import { CompanyEnrichmentCache } from './companyEnrichmentCache.js';
+import { normalizeDomainInput } from './domainInput.js';
 import { formatUpdatedAgo } from './updatedAgo.js';
 
 const MODEL = 'gpt-4o-mini';
@@ -20,7 +21,10 @@ const responseSchema = {
     latest_funding_amount: { type: ['string', 'null'] },
     latest_funding_date: { type: ['string', 'null'] },
     funding_type: { type: ['string', 'null'], enum: ['Pre-Seed', 'Seed', 'Series', 'Other Funding', null] },
-    source_summary: { type: 'string' },
+    source_summary: {
+      type: 'string',
+      description: 'One line. Every non-null field must include its supporting source title and absolute https:// URL.',
+    },
   },
 };
 
@@ -39,7 +43,11 @@ export function loadEnv() {
   }
 }
 
-function buildExtractionPrompt(companyName) {
+function buildExtractionPrompt(companyName, requestedDomain = null) {
+  const identityContext = requestedDomain
+    ? `\nRequested company domain (authoritative): ${requestedDomain}\n\nSource identity checks:\n* When a source displays the company's official website/domain, compare it with the requested company domain after removing only a leading "www.". They must match exactly, including the top-level domain. If they differ, ignore that source entirely for every field. A matching company name or brand is not sufficient.\n`
+    : '';
+
   return `You are researching a company for a recruiting company-intelligence tool.
 
 You MUST use the web search tool to research the company before producing the final JSON. Do not rely only on pretrained knowledge.
@@ -55,6 +63,7 @@ Research the company using web search and determine the following five fields:
 
 Company:
 ${companyName}
+${identityContext}
 
 Research carefully and use reliable sources. Prefer the company's own website, reputable business/financial publications, Crunchbase, PitchBook, company funding announcements, investor websites, and other authoritative sources when available.
 
@@ -73,8 +82,6 @@ Owler is not a preferred source. Use it only as a last-resort fallback when the 
 For funding information, prioritize the company's own funding announcements and Crunchbase, followed by TechCrunch, Reuters, Bloomberg, Forbes, and Fortune. Use another source only when the required information cannot be established from the preferred sources. If a fallback is necessary, prefer established and reputable business, financial, technology, or venture-capital publications.
 
 Avoid low-quality company databases, scraped company profiles, SEO-generated pages, aggregators, and sources whose underlying information cannot be verified. Do not use Caplight for funding amounts, dates, or cumulative funding. If Owler is used as the last-resort fallback, label it [fallback] in source_summary. When sources disagree, prioritize the preferred sources above rather than simply selecting the largest, newest, or most frequently repeated figure.
-
-Do not perform another company-identity verification step; the upstream tool already handles company verification.
 
 Do not guess.
 
@@ -114,7 +121,37 @@ Return ONLY valid JSON in this exact structure:
 "source_summary": "founded_year: [preferred|fallback] Source title — URL; venture_backed: [preferred|fallback] Source title — URL; total_raised: [preferred|fallback] Source title — URL; latest_funding_amount: [preferred|fallback] Source title — URL; latest_funding_date: [preferred|fallback] Source title — URL; funding_type: [preferred|fallback] Source title — URL; public_status: IPO/public status and [preferred|fallback] Source title — URL"
 }
 
-source_summary must be exactly one line. Identify one credible source for each field, using its title and URL, and label it [preferred] when it is from the preferred source list or [fallback] otherwise. If a field is null, write "no reliable source found" for that field. Include public_status only when reliable evidence establishes the company has completed an IPO or is public; otherwise write "public_status: not established". Do not include explanations, markdown, citations, or additional fields.`;
+source_summary must be exactly one line. For EVERY non-null field, include the supporting source title followed by its complete absolute https:// URL. Never omit or abbreviate the URL. Identify one credible source for each field and label it [preferred] when it is from the preferred source list or [fallback] otherwise. If a field is null, write "no reliable source found" for that field. Include public_status only when reliable evidence establishes the company has completed an IPO or is public; otherwise write "public_status: not established".
+
+Do not include explanations, markdown, citations, or additional fields.`;
+}
+
+function collectWebSearchSources(output) {
+  const sources = [];
+  for (const item of output ?? []) {
+    for (const source of item?.action?.sources ?? []) {
+      if (typeof source?.title === 'string' && typeof source?.url === 'string') {
+        sources.push({ title: source.title, url: source.url });
+      }
+    }
+  }
+  return sources;
+}
+
+function normalizeSourceTitle(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function addMissingSourceUrls(sourceSummary, sources) {
+  return sourceSummary.split(';').map((entry) => {
+    if (/https?:\/\//i.test(entry)) return entry.trim();
+    const normalizedEntry = normalizeSourceTitle(entry);
+    const source = sources.find(({ title }) => {
+      const normalizedTitle = normalizeSourceTitle(title);
+      return normalizedTitle && (normalizedEntry.includes(normalizedTitle) || normalizedTitle.includes(normalizedEntry));
+    });
+    return source ? `${entry.trim()} — ${source.url}` : entry.trim();
+  }).join('; ');
 }
 
 function parseExtraction(text) {
@@ -137,7 +174,7 @@ function parseExtraction(text) {
   };
 }
 
-async function researchCompany(companyName) {
+async function researchCompany(companyName, requestedDomain = null) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY is missing. Add it to .env or the environment.');
   }
@@ -147,9 +184,10 @@ async function researchCompany(companyName) {
   const requestStartedAtIso = new Date().toISOString();
   const response = await client.responses.create({
     model: MODEL,
-    input: buildExtractionPrompt(companyName),
+    input: buildExtractionPrompt(companyName, requestedDomain),
     tools: [{ type: 'web_search' }],
     tool_choice: 'required',
+    include: ['web_search_call.action.sources'],
     text: {
       format: {
         type: 'json_schema',
@@ -162,8 +200,9 @@ async function researchCompany(companyName) {
   });
   const researchAndModelMilliseconds = performance.now() - requestStartedAt;
   const { result, sourceSummary } = parseExtraction(response.output_text);
+  const sourceSummaryWithUrls = addMissingSourceUrls(sourceSummary, collectWebSearchSources(response.output));
 
-  return { result, sourceSummary, requestStartedAtIso, researchAndModelMilliseconds };
+  return { result, sourceSummary: sourceSummaryWithUrls, requestStartedAtIso, researchAndModelMilliseconds };
 }
 
 /**
@@ -198,7 +237,7 @@ export async function enrichCompany(companyName, { cache = null, refresh = false
     cachedAt = cached.record.cachedAt;
   } else {
     try {
-      const enrichment = await researchCompany(companyName);
+      const enrichment = await researchCompany(companyName, domain);
       ({ result, sourceSummary, requestStartedAtIso, researchAndModelMilliseconds } = enrichment);
       if (cache) {
         const savedRecord = await cache.set({
@@ -281,13 +320,13 @@ async function confirmClearCache() {
   }
 }
 
-async function companyNamesFromInput(argumentNames) {
+async function domainsFromInput(argumentNames) {
   if (argumentNames.length) return argumentNames;
 
   const terminal = createInterface({ input: process.stdin, output: process.stdout });
-  const companyName = (await terminal.question('Enter company name:')).trim();
+  const companyName = (await terminal.question('Enter company domain or website URL:')).trim();
   terminal.close();
-  if (!companyName) throw new Error('A company name is required.');
+  if (!companyName) throw new Error('A company domain or website URL is required.');
   return [companyName];
 }
 
@@ -298,8 +337,10 @@ async function main() {
     const cache = await CompanyEnrichmentCache.create();
     try {
       if (options.deleteCacheCompany) {
-        const deleted = await cache.invalidate(options.deleteCacheCompany);
-        console.log(`Cache: ${deleted ? 'DELETED' : 'NOT FOUND'} (${options.deleteCacheCompany})`);
+        const domain = normalizeDomainInput(options.deleteCacheCompany);
+        if (!domain) throw new Error('Provide a valid HTTP website URL or domain for --delete-cache.');
+        const deleted = await cache.invalidate(domain);
+        console.log(`Cache: ${deleted ? 'DELETED' : 'NOT FOUND'} (${domain})`);
         return;
       }
 
@@ -315,15 +356,20 @@ async function main() {
     }
   }
 
-  const companyNames = await companyNamesFromInput(options.companyNames);
+  const suppliedDomains = await domainsFromInput(options.companyNames);
+  const domains = suppliedDomains.map((input) => {
+    const domain = normalizeDomainInput(input);
+    if (!domain) throw new Error(`Provide a valid HTTP website URL or domain: ${input}`);
+    return domain;
+  });
   const cache = options.noCache ? null : await CompanyEnrichmentCache.create();
 
   try {
-    for (const companyName of companyNames) {
-      const enrichment = await enrichCompany(companyName, { cache, refresh: options.refresh });
+    for (const domain of domains) {
+      const enrichment = await enrichCompany(domain, { cache, refresh: options.refresh, domain });
 
       const printingStartedAt = performance.now();
-      console.log(`\nCompany: ${companyName}`);
+      console.log(`\nCompany: ${domain}`);
       console.log(`Cache: ${enrichment.cacheStatus}`);
       console.log(`Lookup: ${enrichment.lookupMilliseconds.toFixed(0)}ms`);
       if (enrichment.cacheStatus !== 'HIT') console.log(`GPT Research: ${formatDuration(enrichment.researchAndModelMilliseconds)}`);
